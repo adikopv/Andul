@@ -3,6 +3,7 @@ import requests
 import re
 import json
 from typing import Any, Dict
+import html  # Added for unescaping HTML entities if needed
 
 app = Flask(__name__)
 
@@ -29,10 +30,24 @@ def add_payment_method(user: str, passw: str, details: str) -> Response:
         
         if bin_response.status_code == 200:
             bin_info: Dict[str, Any] = bin_response.json()
-            country: str = bin_info.get('country', 'US')
+            raw_flag: str | None = bin_info.get('country_flag')
+            if raw_flag and len(raw_flag) == 2 and ord(raw_flag[0]) >= 0x1F1E6 and ord(raw_flag[1]) >= 0x1F1E6:
+                # Already proper flag emoji (regional indicators)
+                country_flag: str = raw_flag
+            else:
+                # Fallback: generate from country code
+                country_code: str = bin_info.get('country', 'US').upper()
+                if len(country_code) == 2:
+                    offset = ord('🇦') - ord('A')
+                    country_flag = chr(ord(country_code[0]) + offset) + chr(ord(country_code[1]) + offset)
+                else:
+                    country_flag = '🇺🇸'
+            # For Stripe: use the 2-letter country code
+            country_code: str = bin_info.get('country', 'US').upper()
         else:
             bin_info: Dict[str, Any] = {"error": "BIN info not found or request failed"}
-            country: str = 'US'
+            country_flag: str = '🇺🇸'
+            country_code: str = 'US'
 
         # Create a session to persist cookies across requests
         session: requests.Session = requests.Session()
@@ -82,7 +97,7 @@ def add_payment_method(user: str, passw: str, details: str) -> Response:
             return jsonify({'error': 'Stripe params not found on page'}), 500
         params_str: str = match.group(2)
 
-        # Clean invalid trailing commas in JS object (common issue in inline scripts)
+        # Clean invalid trailing commas in JS object
         params_str = re.sub(r",\s*}", "}", params_str)
         params_str = re.sub(r",\s*]", "]", params_str)
 
@@ -91,7 +106,6 @@ def add_payment_method(user: str, passw: str, details: str) -> Response:
         # Get the correct nonce for creating setup intent
         ajax_nonce: str | None = wc_params.get('createAndConfirmSetupIntentNonce')
         if not ajax_nonce:
-            # Fallback: look for any relevant nonce
             possible_nonces: list[str] = [
                 k for k in wc_params.keys()
                 if 'nonce' in k.lower() and ('setup' in k.lower() or 'intent' in k.lower())
@@ -117,7 +131,7 @@ def add_payment_method(user: str, passw: str, details: str) -> Response:
             f'&card[exp_month]={mm}'
             f'&allow_redisplay=unspecified'
             f'&billing_details[address][postal_code]=10009'
-            f'&billing_details[address][country]={country.upper()}'
+            f'&billing_details[address][country]={country_code}'
             f'&pasted_fields=number'
             f'&payment_user_agent=stripe.js%2Fc264a67020%3B+stripe-js-v3%2Fc264a67020%3B+payment-element%3B+deferred-intent'
             f'&referrer=https%3A%2F%2Fwww.dsegni.com'
@@ -160,18 +174,19 @@ def add_payment_method(user: str, passw: str, details: str) -> Response:
             data=ajax_data
         )
 
-        # Handle JSON or fallback to raw text
         try:
             final_json: Dict[str, Any] = final_response.json()
         except json.JSONDecodeError:
             final_json: Dict[str, Any] = {'raw': final_response.text}
 
-        return jsonify({
+        response_data = {
             'success': True,
             'payment_method_id': pm_id,
             'final_response': final_json,
-            'bin_info': bin_info
-        })
+            'bin_info': bin_info,
+            'country_flag': country_flag  # Now properly displays as 🇨🇳, 🇺🇸, etc.
+        }
+        return Response(json.dumps(response_data, ensure_ascii=False), mimetype='application/json')
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
